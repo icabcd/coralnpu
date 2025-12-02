@@ -18,6 +18,12 @@ load("@coralnpu_hw//third_party/python:requirements.bzl", "requirement")
 load("@rules_hdl//cocotb:cocotb.bzl", "cocotb_test")
 load("@rules_python//python:defs.bzl", "py_library")
 
+# Max number of CPU to use when building the verilated simulator
+_verilator_make_parallelism = 8
+
+def _verilator_resource_estimator(os, input_size):
+    return {"cpu": _verilator_make_parallelism, "memory": 4096}
+
 def _verilator_cocotb_model_impl(ctx):
     """Implementation of the verilator_cocotb_model rule."""
     cc_toolchain = ctx.toolchains["@bazel_tools//tools/cpp:toolchain_type"].cc
@@ -68,7 +74,7 @@ def _verilator_cocotb_model_impl(ctx):
         trace = "--trace" if ctx.attr.trace else "",
     )
 
-    make_cmd = "PATH=`dirname {ld}`:$PATH make -j $(nproc) -C {outdir} -f Vtop.mk {trace} CXX={cxx} AR={ar} LINK={cxx} > {make_log} 2>&1".format(
+    make_cmd = "PATH=`dirname {ld}`:$PATH make -j {parallelism} -C {outdir} -f Vtop.mk {trace} CXX={cxx} AR={ar} LINK={cxx} > {make_log} 2>&1".format(
         outdir = outdir,
         cocotb_lib_path = cocotb_lib_path,
         make_log = make_log.path,
@@ -76,6 +82,7 @@ def _verilator_cocotb_model_impl(ctx):
         ar = ar_executable,
         ld = ld_executable,
         cxx = compiler_executable,
+        parallelism = _verilator_make_parallelism,
     )
 
     script = " && ".join([verilator_cmd.strip(), make_cmd])
@@ -94,6 +101,7 @@ def _verilator_cocotb_model_impl(ctx):
         ),
         command = script,
         mnemonic = "Verilate",
+        resource_set = _verilator_resource_estimator,
     )
 
     return [
@@ -236,7 +244,6 @@ def _verilator_cocotb_test_suite(
         for tc in testcases:
             tc_tests_kwargs = dict(all_tests_kwargs)
             tags = list(tc_tests_kwargs.pop("tags", []))
-            tags.append("manual")
             tags.append("verilator_cocotb_single_test")
             verilator_cocotb_test(
                 name = "{}_{}".format(name, tc),
@@ -250,6 +257,7 @@ def _verilator_cocotb_test_suite(
     # Generate a meta-target for all tests.
     meta_target_kwargs = dict(all_tests_kwargs)
     tags = list(meta_target_kwargs.pop("tags", []))
+    tags.append("manual")
     tags.append("verilator_cocotb_test_suite")
     if testcases_vname:
         tags.append("testcases_vname={}".format(testcases_vname))
@@ -343,7 +351,6 @@ def _vcs_cocotb_test_suite(
         for tc in testcases:
             tc_tests_kwargs = dict(all_tests_kwargs)
             tags = list(tc_tests_kwargs.pop("tags", []))
-            tags.append("manual")
             tags.append("vcs_cocotb_single_test")
             test_args = tc_tests_kwargs.pop("test_args", [""])
             vcs_cocotb_test(
@@ -359,6 +366,7 @@ def _vcs_cocotb_test_suite(
     # Generate a meta-target for all tests.
     meta_target_kwargs = dict(all_tests_kwargs)
     tags = list(meta_target_kwargs.pop("tags", []))
+    tags.append("manual")
     tags.append("vcs_cocotb_test_suite")
     vcs_cocotb_test(
         name = name,

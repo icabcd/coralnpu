@@ -42,9 +42,6 @@ class SCore(p: Parameters) extends Module {
     val dbus = new DBusIO(p)
     val ebus = new EBusIO(p)
 
-    val vldst = Option.when(p.enableVector)(Output(Bool()))
-    val vcore = Option.when(p.enableVector)(Flipped(new VCoreIO(p)))
-
     val rvvcore = Option.when(p.enableRvv)(Flipped(new RvvCoreIO(p)))
 
     val iflush = new IFlushIO(p)
@@ -59,11 +56,7 @@ class SCore(p: Parameters) extends Module {
   val fetch = if (p.enableFetchL0) { Fetch(p) } else { Module(new UncachedFetch(p)) }
 
   val csr = Csr(p)
-  val dispatch = if (p.useDispatchV2) {
-      Module(new DispatchV2(p))
-  } else {
-      Module(new DispatchV1(p))
-  }
+  val dispatch = Module(new DispatchV2(p))
 
   val retirement_buffer = Option.when(p.useRetirementBuffer)(Module(new RetirementBuffer(p)))
   if (p.useRetirementBuffer) {
@@ -126,7 +119,7 @@ class SCore(p: Parameters) extends Module {
   // Decode/Dispatch
   dispatch.io.inst <> fetch.io.inst.lanes
   dispatch.io.halted := csr.io.halted || csr.io.wfi || csr.io.dm.map(_.debug_mode).getOrElse(false.B)
-  dispatch.io.mactive := io.vcore.map(_.mactive).getOrElse(false.B)
+  dispatch.io.mactive := false.B
   dispatch.io.lsuActive := lsu.io.active
   dispatch.io.lsuQueueCapacity := lsu.io.queueCapacity
   dispatch.io.scoreboard.comb := regfile.io.scoreboard.comb
@@ -193,10 +186,6 @@ class SCore(p: Parameters) extends Module {
   csr.io.counters.rfwriteCount := regfile.io.rfwriteCount
   csr.io.counters.storeCount := lsu.io.storeCount
   csr.io.counters.branchCount := bru(0).io.taken.valid
-  if (p.enableVector) {
-    csr.io.counters.vrfwriteCount.get := io.vcore.get.vrfwriteCount
-    csr.io.counters.vstoreCount.get := io.vcore.get.vstoreCount
-  }
 
   // ---------------------------------------------------------------------------
   // Control Status Unit
@@ -235,10 +224,6 @@ class SCore(p: Parameters) extends Module {
     io.dm.get.debug_mode := csr.io.dm.get.debug_mode
   } else {
     csr.io.rs1 := regfile.io.readData(0)
-  }
-
-  if (p.enableVector) {
-    csr.io.vcore.get.undef := io.vcore.get.undef
   }
 
   // ---------------------------------------------------------------------------
@@ -304,42 +289,27 @@ class SCore(p: Parameters) extends Module {
 
     regfile.io.writeData(i).valid := csr0Valid ||
                                      alu(i).io.rd.valid || bru(i).io.rd.valid ||
-                                     (if (p.enableVector) {
-                                        io.vcore.get.rd(i).valid
-                                      } else { false.B }) ||
                                      rvvCoreRdValid
 
     regfile.io.writeData(i).bits.addr :=
         MuxOR(csr0Valid, csr0Addr) |
         MuxOR(alu(i).io.rd.valid, alu(i).io.rd.bits.addr) |
         MuxOR(bru(i).io.rd.valid, bru(i).io.rd.bits.addr) |
-        (if (p.enableVector) {
-           MuxOR(io.vcore.get.rd(i).valid, io.vcore.get.rd(i).bits.addr)
-         } else { false.B }) |
         rvvCoreRdAddr
 
     regfile.io.writeData(i).bits.data :=
         MuxOR(csr0Valid, csr0Data) |
         MuxOR(alu(i).io.rd.valid, alu(i).io.rd.bits.data) |
         MuxOR(bru(i).io.rd.valid, bru(i).io.rd.bits.data) |
-        (if (p.enableVector) {
-           MuxOR(io.vcore.get.rd(i).valid, io.vcore.get.rd(i).bits.data)
-         } else { false.B }) |
         rvvCoreRdData
 
-    if (p.enableVector) {
+    if (p.enableRvv) {
       assert((csr0Valid +&
               alu(i).io.rd.valid +& bru(i).io.rd.valid +&
-              io.vcore.get.rd(i).valid) <= 1.U)
+              io.rvvcore.get.rd(i).valid) <= 1.U)
     } else {
-      if (p.enableRvv) {
-        assert((csr0Valid +&
-                alu(i).io.rd.valid +& bru(i).io.rd.valid +&
-                io.rvvcore.get.rd(i).valid) <= 1.U)
-      } else {
-        assert((csr0Valid +&
-               alu(i).io.rd.valid +& bru(i).io.rd.valid) <= 1.U)
-      }
+      assert((csr0Valid +&
+             alu(i).io.rd.valid +& bru(i).io.rd.valid) <= 1.U)
     }
   }
 
@@ -425,9 +395,7 @@ class SCore(p: Parameters) extends Module {
   regfile.io.writeData(lsuOffset).valid := lsu.io.rd.valid
   regfile.io.writeData(lsuOffset).bits.addr  := lsu.io.rd.bits.addr
   regfile.io.writeData(lsuOffset).bits.data  := lsu.io.rd.bits.data
-  // Mask LSU based on fault for LsuV2 only
-  regfile.io.writeMask(lsuOffset).valid := (
-      if (p.useLsuV2) { lsu.io.fault.valid } else { false.B })
+  regfile.io.writeMask(lsuOffset).valid := lsu.io.fault.valid
 
   val writeMask = bru.map(_.io.taken.valid).scan(false.B)(_||_)
   for (i <- 0 until p.instructionLanes) {
@@ -435,13 +403,6 @@ class SCore(p: Parameters) extends Module {
   }
   if (p.useDebugModule) {
     regfile.io.debugWriteValid.get := io.dm.get.scalar_rd.valid
-  }
-
-  // ---------------------------------------------------------------------------
-  // Vector Extension
-  if (p.enableVector) {
-    io.vcore.get.vinst <> dispatch.io.vinst.get
-    io.vcore.get.rs := regfile.io.readData
   }
 
   // ---------------------------------------------------------------------------
@@ -465,6 +426,18 @@ class SCore(p: Parameters) extends Module {
     csr.io.rvv.get.vxrm := io.rvvcore.get.csr.vxrm
     csr.io.rvv.get.vxsat := io.rvvcore.get.csr.vxsat
   }
+  val isBranching = bru.map(_.io.taken.valid).reduce(_||_)
+  val hasFetchedInstructions = fetch.io.inst.lanes.map(_.valid).reduce(_||_)
+  val floatIdle = if (p.enableFloat) {fRegfile.get.io.scoreboard === 0.U} else {true.B}
+  val rvvIdle = if (p.enableRvv) {io.rvvcore.get.rvv_idle} else {true.B}
+  // Scalar and float arithmetics don't actually trap, we're just trying to be precise here.
+  fault_manager.io.in.fetchFault := fetch.io.fault &&
+      !isBranching &&  // Branches and jumps
+      (regfile.io.scoreboard.regd === 0.U) &&  // Pending scalar operation
+      floatIdle &&  // Pending float operation
+      rvvIdle &&  // Could have vill
+      !lsu.io.active &&  // Could fault
+      !hasFetchedInstructions
 
   // ---------------------------------------------------------------------------
   // Fetch Bus
@@ -475,22 +448,19 @@ class SCore(p: Parameters) extends Module {
   // Arbitrate ready
   lsu.io.ibus.ready := Mux(lsu.io.ibus.valid, io.ibus.ready, false.B)
   fetch.io.ibus.ready := Mux(lsu.io.ibus.valid, false.B, io.ibus.ready)
+  // Arbitrate error
+  fetch.io.ibus.fault := Mux(lsu.io.ibus.valid, MakeInvalid(new FaultInfo(p)), io.ibus.fault)
   // Broadcast rdata
   lsu.io.ibus.rdata := io.ibus.rdata
   fetch.io.ibus.rdata := io.ibus.rdata
 
-  // Tie-off ibus faults in fetch/lsu (unused)
-  fetch.io.ibus.fault := MakeInvalid(new FaultInfo(p))
+  // Tie-off ibus faults in lsu (unused)
   lsu.io.ibus.fault := MakeInvalid(new FaultInfo(p))
 
   // ---------------------------------------------------------------------------
   // Local Data Bus Port
   io.dbus <> lsu.io.dbus
   io.ebus <> lsu.io.ebus
-
-  if (p.enableVector) {
-    io.vldst.get := lsu.io.vldst
-  }
 
   // ---------------------------------------------------------------------------
   // Scalar logging interface

@@ -26,12 +26,6 @@ import common._
 import coralnpu.float.{FloatInstruction, FloatOpcode}
 import coralnpu.rvv._
 
-object Decode {
-  def apply(p: Parameters, pipeline: Int): Decode = {
-    return Module(new Decode(p, pipeline))
-  }
-}
-
 class DecodeSerializeIO extends Bundle {
   val lsu = Output(Bool())
   val mul = Output(Bool())
@@ -143,13 +137,6 @@ class DecodedInstruction(p: Parameters) extends Bundle {
   val zexth = Bool()
   val rori = Bool()
 
-  // Vector instructions.
-  val getvl = Bool()
-  val getmaxvl = Bool()
-  val vld = Bool()
-  val vst = Bool()
-  val viop = Bool()
-
   // Core controls.
   val ebreak = Bool()
   val ecall  = Bool()
@@ -193,7 +180,7 @@ class DecodedInstruction(p: Parameters) extends Bundle {
     float.map(f => f.valid && f.bits.opcode === FloatOpcode.STOREFP).getOrElse(false.B)
   }
   def isLsu(): Bool = {
-      isScalarLoad() || isScalarStore() || vld || vst || flushat || flushall ||
+      isScalarLoad() || isScalarStore() || flushat || flushall ||
       isFloatLoad() || isFloatStore() || (if (p.enableRvv) {
         rvv.get.valid && rvv.get.bits.isLoadStore()
       } else {
@@ -202,7 +189,6 @@ class DecodedInstruction(p: Parameters) extends Bundle {
   }
   def isMul(): Bool = { mul || mulh || mulhsu || mulhu }
   def isDvu(): Bool = { div || divu || rem || remu }
-  def isVector(): Bool = { vld || vst || viop || getvl || getmaxvl }
   def isFency(): Bool = { fencei || ebreak || wfi || mpause || flushat || flushall }
 
   // Instructions that should dispatch out of slot 0, with no other instructions
@@ -219,7 +205,8 @@ class DecodedInstruction(p: Parameters) extends Bundle {
   }
 
   def floatWritesRd(): Bool = { float.map(f => f.valid && f.bits.scalar_rd).getOrElse(false.B) }
-  def floatReadsRs1(): Bool = { float.map(f => f.valid && f.bits.scalar_rs1).getOrElse(false.B) }
+  def floatReadsScalarRs1(): Bool = { float.map(f => f.valid && f.bits.scalar_rs1).getOrElse(false.B) }
+  def floatReadsFloatRs1(): Bool = { float.map(f => f.valid && f.bits.float_rs1).getOrElse(false.B) }
   def floatReadsRs2(): Bool = { float.map(f => f.valid && f.bits.uses_rs2).getOrElse(false.B) }
   def floatReadsRs3(): Bool = { float.map(f => f.valid && f.bits.uses_rs3).getOrElse(false.B) }
 
@@ -233,12 +220,12 @@ class DecodedInstruction(p: Parameters) extends Bundle {
 
   def readsRs1(): Bool = {
     isCondBr() || isAluReg() || isAluImm() || isAlu1Bit() || isAlu2Bit() ||
-    isCsr() || isMul() || isDvu() || slog || getvl || vld || vst || jalr || floatReadsRs1() ||
+    isCsr() || isMul() || isDvu() || slog || jalr || floatReadsScalarRs1() ||
     (if (p.enableRvv) { rvv.get.valid && rvv.get.bits.readsRs1() } else { false.B })
   }
   def readsRs2(): Bool = {
     isCondBr() || isAluReg() || isAlu2Bit() || isScalarStore() || isCsrReg() ||
-    isMul() || isDvu() || slog || getvl || vld || vst || viop ||
+    isMul() || isDvu() || slog ||
     (if (p.enableRvv) { rvv.get.valid && rvv.get.bits.readsRs2() } else { false.B })
   }
 
@@ -315,12 +302,6 @@ class Dispatch(p: Parameters) extends Module {
     val rvvIdle = Option.when(p.enableRvv)(Input(Bool()))
     val rvvQueueCapacity = Option.when(p.enableRvv)(Input(UInt(4.W)))
 
-    // Vector interface, to maintain interface compatibility with old dispatch
-    // unit.
-    val vinst = if (p.enableVector) {
-      Some(Vec(p.instructionLanes, Decoupled(new VInstCmd)))
-    } else { None }
-
     val float = if (p.enableFloat) {
       Some(Decoupled(new FloatInstruction))
     } else { None }
@@ -337,17 +318,6 @@ class Dispatch(p: Parameters) extends Module {
 }
 
 class DispatchV2(p: Parameters) extends Dispatch(p) {
-  assert(!p.enableVector, "DispatchV2 does not support legacy vector core")
-  // Still need guard to tie-off
-  if (p.enableVector) {
-    for (i <- 0 until p.instructionLanes) {
-      io.vinst.get(i).valid := false.B
-      io.vinst.get(i).bits.op := VInstOp.VIOP
-      io.vinst.get(i).bits.addr := 0.U
-      io.vinst.get(i).bits.inst := 0.U
-    }
-  }
-
   // Decode instructions
   val decodedInsts = (0 until p.instructionLanes).map(i =>
     DecodeInstruction(p, i, io.inst(i).bits.addr, io.inst(i).bits.inst)
@@ -410,7 +380,7 @@ class DispatchV2(p: Parameters) extends Dispatch(p) {
   val rs3Addr = io.inst.map(_.bits.inst(31,27))
   val writesFloatRd = decodedInsts.map(d => d.isFloat() && !d.floatWritesRd())
   val floatReadScoreboard = if (p.enableFloat) { (0 until p.instructionLanes).map(i =>
-    MuxOR(decodedInsts(i).floatReadsRs1(), UIntToOH(rs1Addr(i), 32)) |
+    MuxOR(decodedInsts(i).floatReadsFloatRs1(), UIntToOH(rs1Addr(i), 32)) |
     MuxOR(decodedInsts(i).floatReadsRs2(), UIntToOH(rs2Addr(i), 32)) |
     MuxOR(decodedInsts(i).floatReadsRs3(), UIntToOH(rs3Addr(i), 32))
   ) } else { (0 until p.instructionLanes).map(_ => 0.U(32.W)) }
@@ -493,13 +463,9 @@ class DispatchV2(p: Parameters) extends Dispatch(p) {
   // LSU Interlock
   val isLsu = decodedInsts.map(x => x.isLsu())
   val isLsuCount = isLsu.scan(0.U(4.W))(_+_)
-  val lsuInterlock = if (p.useLsuV2) {
+  val lsuInterlock =
       (0 until p.instructionLanes).map(
           i => isLsuCount(i) < io.lsuQueueCapacity)
-  } else {
-    // For LSU V1, backpressure from ready/valid handshake to interlock LSU.
-    Seq.fill(p.instructionLanes)(true.B)
-  }
 
   // ---------------------------------------------------------------------------
   // Undef
@@ -529,7 +495,8 @@ class DispatchV2(p: Parameters) extends Dispatch(p) {
 
   // ---------------------------------------------------------------------------
   // MPAUSE
-  val mpauseInterlock = decodedInsts.map(x => (!x.mpause || coreIdle))
+  val mpauseInterlock = (0 until p.instructionLanes).map(i =>
+    !decodedInsts(i).mpause || ((i == 0).B && coreIdle))
 
   // ---------------------------------------------------------------------------
   // Combine above rules. This variable represents which instructions can be
@@ -843,512 +810,6 @@ class DispatchV2(p: Parameters) extends Dispatch(p) {
   }
 }
 
-class DispatchV1(p: Parameters) extends Dispatch(p) {
-  val decode = (0 until p.instructionLanes).map(x => Decode(p, x))
-
-  val mask = VecInit(decode.map(_.io.inst.ready).scan(true.B)(_ && _))
-  for (i <- 0 until p.instructionLanes) {
-    decode(i).io.inst.valid := io.inst(i).valid && mask(i)
-    io.inst(i).ready := decode(i).io.inst.ready && mask(i)
-    decode(i).io.inst.bits.addr := io.inst(i).bits.addr
-    decode(i).io.inst.bits.inst := io.inst(i).bits.inst
-    decode(i).io.inst.bits.brchFwd := io.inst(i).bits.brchFwd
-
-    decode(i).io.branchTaken := io.branchTaken
-    decode(i).io.halted := io.halted
-    decode(i).io.jalrTarget := io.jalrTarget(i)
-    io.csrFault(i) := decode(i).io.csrFault.getOrElse(false.B) && !io.branchTaken && decode(i).io.inst.valid
-    io.jalrFault(i) := decode(i).io.jalrFault && !io.branchTaken && decode(i).io.inst.valid
-    io.jalFault(i) := decode(i).io.jalFault && !io.branchTaken && decode(i).io.inst.valid
-    io.bxxFault(i) := decode(i).io.bxxFault & !io.branchTaken && decode(i).io.inst.valid
-    io.undefFault(i) := decode(i).io.undefFault & !io.branchTaken && decode(i).io.inst.valid
-    if (p.enableRvv) { io.rvvFault.get(i) := false.B }
-
-    io.bruTarget(i) := decode(i).io.bruTarget
-  }
-
-  // Interlock based on regfile write port dependencies.
-  decode(0).io.interlock := io.interlock
-  for (i <- 1 until p.instructionLanes) {
-    decode(i).io.interlock := decode(i - 1).io.interlock
-  }
-
-  // Serialize opcodes with only one pipeline.
-  decode(0).io.serializeIn.defaults()
-  for (i <- 1 until p.instructionLanes) {
-    decode(i).io.serializeIn := decode(i - 1).io.serializeOut
-  }
-
-  // In decode update multi-issue scoreboard state.
-  val scoreboard_spec = decode.map(_.io.scoreboard.spec).scan(0.U)(_|_)
-  for (i <- 0 until p.instructionLanes) {
-    decode(i).io.scoreboard.comb := io.scoreboard.comb | scoreboard_spec(i)
-    decode(i).io.scoreboard.regd := io.scoreboard.regd | scoreboard_spec(i)
-  }
-
-  // Active signals (for mpause, WFI)
-  decode(0).io.mactive := io.mactive
-  decode(0).io.lsuActive := io.lsuActive
-  for (i <- 1 until p.instructionLanes) {
-    decode(i).io.mactive := false.B
-    decode(i).io.lsuActive := false.B
-  }
-
-  // Connect Regfile inputs
-  io.rs1Read := decode.map(_.io.rs1Read)
-  io.rs1Set  := decode.map(_.io.rs1Set)
-  io.rs2Read := decode.map(_.io.rs2Read)
-  io.rs2Set  := decode.map(_.io.rs2Set)
-  io.rdMark  := decode.map(_.io.rdMark)
-  io.busRead := decode.map(_.io.busRead)
-  if (p.enableFloat) {
-    io.rdMark_flt.get := decode(0).io.rdMark_flt.get
-    val rs2Addr = io.inst(0).bits.inst(24,20)
-    io.fbusPortAddr.get := rs2Addr
-  }
-
-  // Connect outputs
-  io.alu := decode.map(_.io.alu)
-  io.bru := decode.map(_.io.bru)
-  io.lsu <> decode.map(_.io.lsu)
-  io.mlu <> decode.map(_.io.mlu)
-  io.dvu <> decode.map(_.io.dvu)
-  if (p.enableVector) {
-    io.vinst.get <> decode.map(_.io.vinst.get)
-  }
-  if (p.enableRvv) {
-    io.rvv.get <> decode.map(_.io.rvv.get)
-  }
-
-  if (p.enableFloat) {
-    io.float.get <> decode(0).io.float.get
-    decode(0).io.fscoreboard.get := io.fscoreboard.get
-  }
-
-  io.csr := decode(0).io.csr
-  io.slog := decode(0).io.slog
-}
-
-class Decode(p: Parameters, pipeline: Int) extends Module {
-  val io = IO(new Bundle {
-    // Core controls.
-    val halted = Input(Bool())
-
-    // Decode input interface.
-    val inst = Flipped(Decoupled(new FetchInstruction(p)))
-    val scoreboard = new Bundle {
-      val regd = Input(UInt(32.W))
-      val comb = Input(UInt(32.W))
-      val spec = Output(UInt(32.W))
-    }
-    val fscoreboard = Option.when(p.enableFloat && pipeline == 0)(Input(UInt(32.W)))
-    val mactive = Input(Bool())  // memory active
-    val lsuActive = Input(Bool()) // lsu active
-
-    // Register file decode cycle interface.
-    val rs1Read = Flipped(new RegfileReadAddrIO)
-    val rs1Set  = Flipped(new RegfileReadSetIO)
-    val rs2Read = Flipped(new RegfileReadAddrIO)
-    val rs2Set  = Flipped(new RegfileReadSetIO)
-    val rdMark  = Flipped(new RegfileWriteAddrIO)
-    val rdMark_flt  = Option.when(p.enableFloat && pipeline == 0)(Flipped(new RegfileWriteAddrIO))
-    val busRead = Flipped(new RegfileBusAddrIO)
-    val jalFault = Output(Bool())
-    val jalrFault = Output(Bool())
-    val bxxFault = Output(Bool())
-    val undefFault = Output(Bool())
-    val bruTarget = Output(UInt(32.W))
-    val jalrTarget = Input(new RegfileBranchTargetIO)
-
-    // ALU interface.
-    val alu = Valid(new AluCmd)
-
-    // Branch interface.
-    val bru = Valid(new BruCmd(p))
-
-    // CSR interface.
-    val csr = Valid(new CsrCmd)
-    val csrFault = if (pipeline == 0) { Some(Output(Bool())) } else { None }
-
-    // LSU interface.
-    val lsu = Decoupled(new LsuCmd(p))
-
-    // Multiplier interface.
-    val mlu = Decoupled(new MluCmd)
-
-    // Divide interface.
-    val dvu = Decoupled(new DvuCmd)
-
-    // Vector interface.
-    val vinst = if (p.enableVector) {
-      Some(Decoupled(new VInstCmd))
-    } else { None }
-
-    // Rvv interface.
-    val rvv = if (p.enableRvv) {
-      Some(Decoupled(new RvvCompressedInstruction))
-    } else { None }
-
-    val float = if (p.enableFloat && pipeline == 0) {
-      Some(Decoupled(new FloatInstruction))
-    } else { None }
-
-    // Branch status.
-    val branchTaken = Input(Bool())
-
-    // Interlock Controls
-    val interlock = Input(Bool())
-    val serializeIn  = Flipped(new DecodeSerializeIO)
-    val serializeOut = new DecodeSerializeIO
-
-    // Scalar logging.
-    val slog = Output(Bool())
-  })
-
-  val decodeEn = io.inst.valid && io.inst.ready && !io.branchTaken
-
-  // The decode logic.
-  val d = DecodeInstruction(p, pipeline, io.inst.bits.addr, io.inst.bits.inst)
-
-  val wfi = d.wfi
-
-  val vldst = d.vld || d.vst
-  val vldst_wb = vldst && io.inst.bits.inst(28)
-
-  val rdAddr  = Mux(vldst, io.inst.bits.inst(19,15), io.inst.bits.inst(11,7))
-  val rs1Addr = io.inst.bits.inst(19,15)
-  val rs2Addr = io.inst.bits.inst(24,20)
-  val rs3Addr = io.inst.bits.inst(31,27)
-
-  val isVIop = if (p.enableVector) {
-    io.vinst.get.bits.op === VInstOp.VIOP
-  } else { false.B }
-
-  val isVIopVs1 = isVIop
-  val isVIopVs2 = isVIop && io.inst.bits.inst(1,0) === 0.U  // exclude: .vv
-  val isVIopVs3 = isVIop && io.inst.bits.inst(2,0) === 1.U  // exclude: .vvv
-
-  // Use the forwarded scoreboard to interlock on multicycle operations.
-  val aluRdEn  = !io.scoreboard.comb(rdAddr)  || isVIopVs1 || d.isScalarStore() || d.isCondBr()
-  val aluRs1En = !io.scoreboard.comb(rs1Addr) || isVIopVs1 || d.isLsu() || d.auipc || d.lui
-  val aluRs2En = !io.scoreboard.comb(rs2Addr) || isVIopVs2 || d.isLsu() || d.auipc || d.lui || d.isAluImm() || d.isAlu1Bit() || d.isFloat()
-  // val aluRs3En = !io.scoreboard.comb(rs3Addr) || isVIopVs3
-  // val aluEn = aluRdEn && aluRs1En && aluRs2En && aluRs3En  // TODO: is aluRs3En needed?
-  val aluEn = aluRdEn && aluRs1En && aluRs2En
-
-  // Interlock jalr but special case return.
-  val bruEn = !d.jalr || !io.scoreboard.regd(rs1Addr) ||
-              (io.inst.bits.inst(31,20) === 0.U && rdAddr === 0.U && rs1Addr === 1.U)
-
-  // Require interlock on address generation as there is no write forwarding.
-  val lsuEn = !d.isLsu() ||
-              !io.serializeIn.lsu && io.lsu.ready &&
-              (!d.isLsu() || !io.serializeIn.brcond) &&  // TODO: can this line be removed?
-              !(Mux(io.busRead.bypass, io.scoreboard.comb(rs1Addr),
-                    io.scoreboard.regd(rs1Addr)) ||
-                    io.scoreboard.comb(rs2Addr) && (d.isScalarStore() || vldst))
-
-  // Interlock mul, only one lane accepted.
-  val mulEn = (!d.isMul() || !io.serializeIn.mul) && !io.serializeIn.brcond
-
-  // Vector extension interlock.
-  val vinstEn = if (p.enableVector) {
-      !(io.serializeIn.vinst || isVIop && io.serializeIn.brcond) &&
-      !(d.isVector() && !io.vinst.get.ready)
-  } else {
-    // When vector is disabled, we never want to interlock due to it.
-    // Thus, always return true in that case.
-    true.B
-  }
-
-  // Rvv extension interlock
-  val rvvEn = if (p.enableRvv) {
-    !io.serializeIn.brcond && !(d.rvv.get.valid && !io.rvv.get.ready)
-  } else { true.B }
-
-  val floatEn = if (p.enableFloat && pipeline == 0) {
-    !d.float.get.valid ||
-    (d.float.get.valid && d.isFloatLoad()) ||
-    (!io.serializeIn.float && io.float.get.ready) &&
-    !io.serializeIn.brcond && !io.lsuActive &&
-    !(d.float.get.valid && d.float.get.bits.scalar_rd && io.scoreboard.comb(rdAddr)) &&
-    !(d.float.get.valid && d.float.get.bits.scalar_rs1 && io.scoreboard.comb(rs1Addr)) &&
-    !(d.float.get.valid && !d.float.get.bits.scalar_rd && io.fscoreboard.get(rdAddr)) &&
-    !(d.float.get.valid && !d.float.get.bits.scalar_rs1 && io.fscoreboard.get(rs1Addr)) &&
-    !(d.float.get.valid && io.fscoreboard.get(rs2Addr)) &&
-    !(d.float.get.valid && io.fscoreboard.get(rs3Addr))
-  } else { true.B }
-
-  // Fence interlock.
-  // Input mactive used passthrough, prefer to avoid registers in Decode.
-  val fenceEn = !(d.isFency() && (io.mactive || io.lsuActive)) && !(io.serializeIn.fence)
-
-  // ALU opcode.
-  val alu = MuxCase(MakeValid(false.B, AluOp.ADD), Seq(
-    // RV32IM
-    (d.auipc || d.addi || d.add) -> MakeValid(true.B, AluOp.ADD),
-    d.sub                        -> MakeValid(true.B, AluOp.SUB),
-    (d.slti || d.slt)            -> MakeValid(true.B, AluOp.SLT),
-    (d.sltiu || d.sltu)          -> MakeValid(true.B, AluOp.SLTU),
-    (d.xori || d.xor)            -> MakeValid(true.B, AluOp.XOR),
-    (d.ori || d.or)              -> MakeValid(true.B, AluOp.OR),
-    (d.andi || d.and)            -> MakeValid(true.B, AluOp.AND),
-    (d.slli || d.sll)            -> MakeValid(true.B, AluOp.SLL),
-    (d.srli || d.srl)            -> MakeValid(true.B, AluOp.SRL),
-    (d.srai || d.sra)            -> MakeValid(true.B, AluOp.SRA),
-    d.lui                        -> MakeValid(true.B, AluOp.LUI),
-    // ZBB
-    d.andn                       -> MakeValid(true.B, AluOp.ANDN),
-    d.orn                        -> MakeValid(true.B, AluOp.ORN),
-    d.xnor                       -> MakeValid(true.B, AluOp.XNOR),
-    d.clz                        -> MakeValid(true.B, AluOp.CLZ),
-    d.ctz                        -> MakeValid(true.B, AluOp.CTZ),
-    d.cpop                       -> MakeValid(true.B, AluOp.CPOP),
-    d.max                        -> MakeValid(true.B, AluOp.MAX),
-    d.maxu                       -> MakeValid(true.B, AluOp.MAXU),
-    d.min                        -> MakeValid(true.B, AluOp.MIN),
-    d.minu                       -> MakeValid(true.B, AluOp.MINU),
-    d.sextb                      -> MakeValid(true.B, AluOp.SEXTB),
-    d.sexth                      -> MakeValid(true.B, AluOp.SEXTH),
-    d.rol                        -> MakeValid(true.B, AluOp.ROL),
-    d.ror                        -> MakeValid(true.B, AluOp.ROR),
-    d.orcb                       -> MakeValid(true.B, AluOp.ORCB),
-    d.rev8                       -> MakeValid(true.B, AluOp.REV8),
-    d.zexth                      -> MakeValid(true.B, AluOp.ZEXTH),
-    d.rori                       -> MakeValid(true.B, AluOp.ROR),
-  ))
-  io.alu.valid := decodeEn && alu.valid
-  io.alu.bits.addr := rdAddr
-  io.alu.bits.op := alu.bits
-
-  // Branch conditional opcode.
-  val bru = MuxCase(MakeValid(false.B, BruOp.JAL), Seq(
-    d.jal    -> MakeValid(true.B, BruOp.JAL),
-    d.jalr   -> MakeValid(true.B, BruOp.JALR),
-    d.beq    -> MakeValid(true.B, BruOp.BEQ),
-    d.bne    -> MakeValid(true.B, BruOp.BNE),
-    d.blt    -> MakeValid(true.B, BruOp.BLT),
-    d.bge    -> MakeValid(true.B, BruOp.BGE),
-    d.bltu   -> MakeValid(true.B, BruOp.BLTU),
-    d.bgeu   -> MakeValid(true.B, BruOp.BGEU),
-    d.ebreak -> MakeValid(true.B, BruOp.EBREAK),
-    d.ecall  -> MakeValid(true.B, BruOp.ECALL),
-    d.mpause -> MakeValid(true.B, BruOp.MPAUSE),
-    d.mret   -> MakeValid(true.B, BruOp.MRET),
-    d.wfi    -> MakeValid(true.B, BruOp.WFI),
-  ))
-  val bru_target = io.inst.bits.addr + Mux(
-      io.inst.bits.inst(2), d.immjal, d.immbr)
-  val jalr_fault = bruEn && bru.valid && (io.bru.bits.op === BruOp.JALR) && ((io.jalrTarget.data & 2.U) =/= 0.U)
-  io.jalrFault := jalr_fault
-  val jal_fault = bruEn && bru.valid && (io.bru.bits.op === BruOp.JAL) && ((bru_target & 0x3.U) =/= 0.U)
-  io.jalFault := jal_fault
-  io.bruTarget := bru_target
-  val bxx_fault =
-    bruEn && bru.valid &&
-    (io.bru.bits.op.isOneOf(BruOp.BEQ, BruOp.BNE, BruOp.BLT, BruOp.BGE, BruOp.BLTU, BruOp.BGEU)) &&
-    ((bru_target & 0x3.U) =/= 0.U)
-  io.bxxFault := bxx_fault
-  io.undefFault := io.inst.valid && d.undef && (pipeline.U === 0.U)
-
-  io.bru.valid := decodeEn && bru.valid && !(jalr_fault || jal_fault || bxx_fault)
-  io.bru.bits.fwd := io.inst.bits.brchFwd
-  io.bru.bits.op := bru.bits
-  io.bru.bits.pc := io.inst.bits.addr
-  io.bru.bits.target := bru_target
-  io.bru.bits.link := rdAddr
-  io.bru.bits.inst := io.inst.bits.inst
-
-  // CSR opcode.
-  val csr = MuxCase(MakeValid(false.B, CsrOp.CSRRW), Seq(
-    d.csrrw -> MakeValid(true.B, CsrOp.CSRRW),
-    d.csrrs -> MakeValid(true.B, CsrOp.CSRRS),
-    d.csrrc -> MakeValid(true.B, CsrOp.CSRRC)
-  ))
-  io.csr.bits.addr := rdAddr
-  io.csr.bits.index := io.inst.bits.inst(31,20)
-  io.csr.bits.op := csr.bits
-
-  var csr_fault = false.B
-  val csrEn = (!d.isCsr()) || csr.valid && io.float.map(x => x.ready).getOrElse(true.B)
-  if (pipeline == 0) {
-    val (csr_address, csr_address_valid) = CsrAddress.safe(io.inst.bits.inst(31,20))
-    csr_fault = csr.valid && !csr_address_valid
-    io.csrFault.get := csrEn && csr_fault
-    io.csr.valid := decodeEn && csr.valid && !csr_fault
-  } else {
-    io.csr.valid := decodeEn && csr.valid
-  }
-
-  // LSU opcode.
-  val lsu = MuxCase(MakeValid(false.B, LsuOp.LB), Seq(
-    d.lb             -> MakeValid(true.B, LsuOp.LB),
-    d.lh             -> MakeValid(true.B, LsuOp.LH),
-    d.lw             -> MakeValid(true.B, LsuOp.LW),
-    d.lbu            -> MakeValid(true.B, LsuOp.LBU),
-    d.lhu            -> MakeValid(true.B, LsuOp.LHU),
-    d.sb             -> MakeValid(true.B, LsuOp.SB),
-    d.sh             -> MakeValid(true.B, LsuOp.SH),
-    d.sw             -> MakeValid(true.B, LsuOp.SW),
-    d.wfi            -> MakeValid(true.B, LsuOp.FENCEI),
-    d.fencei         -> MakeValid(true.B, LsuOp.FENCEI),
-    d.flushat        -> MakeValid(true.B, LsuOp.FLUSHAT),
-    d.flushall       -> MakeValid(true.B, LsuOp.FLUSHALL),
-    (d.vld || d.vst) -> MakeValid(true.B, LsuOp.VLDST),
-    (d.isFloatLoad() || d.isFloatStore()) -> MakeValid(true.B, LsuOp.FLOAT)
-  ))
-  io.lsu.valid := decodeEn && lsu.valid
-  io.lsu.bits.store := io.inst.bits.inst(5)
-  io.lsu.bits.addr := rdAddr
-  io.lsu.bits.op := lsu.bits
-  io.lsu.bits.pc := io.inst.bits.addr
-  if (p.enableRvv) {
-    io.lsu.bits.elemWidth.get := io.inst.bits.inst(14,12)
-    io.lsu.bits.nfields.get := io.inst.bits.inst(31,29)
-    io.lsu.bits.umop.get := io.inst.bits.inst(24,20)
-  }
-
-  // MLU opcode.
-  val mlu = MuxCase(MakeValid(false.B, MluOp.MUL), Seq(
-    d.mul     -> MakeValid(true.B, MluOp.MUL),
-    d.mulh    -> MakeValid(true.B, MluOp.MULH),
-    d.mulhsu  -> MakeValid(true.B, MluOp.MULHSU),
-    d.mulhu   -> MakeValid(true.B, MluOp.MULHU),
-  ))
-  io.mlu.valid := decodeEn && mlu.valid
-  io.mlu.bits.addr := rdAddr
-  io.mlu.bits.op := mlu.bits
-
-  // DIV opcode.
-  val dvu = MuxCase(MakeValid(false.B, DvuOp.DIV), Seq(
-    d.div  -> MakeValid(true.B, DvuOp.DIV),
-    d.divu -> MakeValid(true.B, DvuOp.DIVU),
-    d.rem  -> MakeValid(true.B, DvuOp.REM),
-    d.remu -> MakeValid(true.B, DvuOp.REMU)
-  ))
-  io.dvu.valid := decodeEn && dvu.valid
-  io.dvu.bits.addr := rdAddr
-  io.dvu.bits.op := dvu.bits
-  val dvuEn = !dvu.valid || io.dvu.ready
-
-  // Vector instructions.
-  val vinst = MuxCase(MakeValid(false.B, VInstOp.VLD), Seq(
-    d.vld      -> MakeValid(true.B, VInstOp.VLD),
-    d.vst      -> MakeValid(true.B, VInstOp.VST),
-    d.viop     -> MakeValid(true.B, VInstOp.VIOP),
-    d.getvl    -> MakeValid(true.B, VInstOp.GETVL),
-    d.getmaxvl -> MakeValid(true.B, VInstOp.GETMAXVL),
-  ))
-  if (p.enableVector) {
-    io.vinst.get.valid := decodeEn && vinst.valid
-    io.vinst.get.bits.addr := rdAddr
-    io.vinst.get.bits.inst := io.inst.bits.inst
-    io.vinst.get.bits.op := vinst.bits
-  }
-
-  if (p.enableRvv) {
-    io.rvv.get.valid := d.rvv.get.valid && !io.branchTaken &&
-        !io.serializeIn.jump && !io.serializeOut.brcond && !io.serializeOut.wfi
-    io.rvv.get.bits := d.rvv.get.bits
-  }
-
-  if (p.enableFloat && pipeline == 0) {
-    io.float.get.valid := decodeEn && d.float.get.valid && !io.branchTaken &&
-                          !io.serializeIn.float && !(d.isFloatLoad())
-    io.float.get.bits := d.float.get.bits
-  }
-
-  // Scalar logging.
-  io.slog := decodeEn && d.slog
-
-  // Register file read ports.
-  io.rs1Read.valid := decodeEn && d.readsRs1()
-  io.rs2Read.valid := decodeEn && d.readsRs2()
-
-  // rs1 is on critical path to busPortAddr.
-  io.rs1Read.addr := Mux(io.inst.bits.inst(0), rs1Addr, rs3Addr)
-
-  // rs2 is used for the vector operation scalar value.
-  io.rs2Read.addr := rs2Addr
-
-  // Register file set ports.
-  io.rs1Set.valid := decodeEn && d.rs1Set()
-  io.rs2Set.valid := decodeEn && d.rs2Set()
-
-  io.rs1Set.value := Mux(d.isCsr(), d.immcsr, io.inst.bits.addr)  // Program Counter (PC)
-
-  io.rs2Set.value := MuxCase(d.imm12,
-                     IndexedSeq((d.auipc || d.lui) -> d.imm20))
-
-  // Register file write address ports. We speculate without knowing the decode
-  // enable status to improve timing, and under a branch is ignored anyway.
-  val rdMark_valid =
-      alu.valid || (csr.valid && io.csr.valid) || mlu.valid || dvu.valid && io.dvu.ready ||
-      lsu.valid && d.isScalarLoad() ||
-      d.getvl || d.getmaxvl || vldst_wb ||
-      d.rvv.map(x => x.valid && x.bits.writesRd()).getOrElse(false.B) ||
-      d.float.map(x => x.valid && x.bits.scalar_rd).getOrElse(false.B) ||
-      bru.valid && (bru.bits.isOneOf(BruOp.JAL, BruOp.JALR)) && rdAddr =/= 0.U
-
-  if (p.enableFloat && pipeline == 0) {
-    val rdMark_flt_valid = d.float.get.valid && !d.float.get.bits.scalar_rd && (d.float.get.bits.opcode =/= FloatOpcode.STOREFP)
-    io.rdMark_flt.get.valid := decodeEn && rdMark_flt_valid
-    io.rdMark_flt.get.addr := rdAddr
-  }
-
-  // val scoreboard_spec = Mux(rdMark_valid || d.io.vst, UIntToOH(rdAddr, 32), 0.U)  // TODO: why was d.io.vst included?
-  val scoreboard_spec = Mux(rdMark_valid, UIntToOH(rdAddr, 32), 0.U)
-  io.scoreboard.spec := Cat(scoreboard_spec(31,1), 0.U(1.W))
-
-  io.rdMark.valid := decodeEn && rdMark_valid
-  io.rdMark.addr  := rdAddr
-
-  // Register file bus address port.
-  // Pointer chasing bypass if immediate is zero.
-  // Load/Store immediate selection keys off bit5, and RET off bit6.
-  io.busRead.valid := lsu.valid
-  io.busRead.bypass := io.inst.bits.inst(31,25) === 0.U &&
-    Mux(!io.inst.bits.inst(5) || io.inst.bits.inst(6),
-        io.inst.bits.inst(24,20) === 0.U,
-         io.inst.bits.inst(11,7) === 0.U)
-
-  // SB,SH,SW   0100011
-  val storeSelect = io.inst.bits.inst(6,3) === 4.U && io.inst.bits.inst(1,0) === 3.U
-  io.busRead.immen := !d.flushat
-  io.busRead.immed := Cat(d.imm12(31,5),
-                          Mux(storeSelect, d.immst(4,0), d.imm12(4,0)))
-
-
-  // Decode ready signalling to fetch.
-  // This must not factor branchTaken, which will be done directly in the
-  // fetch unit. Note above decodeEn resolves for branch for execute usage.
-  io.inst.ready := aluEn && bruEn && lsuEn && mulEn && dvuEn && vinstEn && fenceEn &&
-                   rvvEn && !io.serializeIn.jump && !io.serializeIn.wfi &&
-                   floatEn && csrEn &&
-                   !io.serializeIn.undef &&
-                   !io.serializeIn.csr &&
-                   !io.halted && !io.interlock &&
-                   (pipeline.U === 0.U || !d.undef) &&
-                   !(jal_fault || jalr_fault || csr_fault || bxx_fault)
-
-  // Serialize Interface.
-  // io.serializeOut.lsu  := io.serializeIn.lsu || lsu.valid || vldst  // vldst interlock for address generation cycle in vinst
-  // io.serializeOut.lsu  := io.serializeIn.lsu || vldst  // vldst interlock for address generation cycle in vinst
-  io.serializeOut.lsu  := io.serializeIn.lsu
-  io.serializeOut.mul  := io.serializeIn.mul || mlu.valid
-  io.serializeOut.fence := d.isFency() || io.serializeIn.fence
-  io.serializeOut.jump := io.serializeIn.jump || d.jal || d.jalr ||
-                          d.ebreak || d.ecall ||
-                          d.mpause || d.mret
-  io.serializeOut.brcond := io.serializeIn.brcond |
-      d.beq || d.bne || d.blt || d.bge || d.bltu || d.bgeu
-  io.serializeOut.vinst := io.serializeIn.vinst
-  io.serializeOut.wfi := io.serializeIn.wfi || d.wfi
-  io.serializeOut.csr := io.serializeIn.csr || d.csrrw || d.csrrs || d.csrrc
-  io.serializeOut.undef := io.serializeIn.undef || d.undef
-  io.serializeOut.float := io.serializeIn.float || d.isFloat()
-}
-
 object DecodeInstruction {
   def apply(p: Parameters, pipeline: Int, addr: UInt, op: UInt): DecodedInstruction = {
     val d = Wire(new DecodedInstruction(p))
@@ -1439,36 +900,6 @@ object DecodeInstruction {
     // Decode scalar log.
     val slog = op === BitPat("b01111_00_00000_?????_0??_00000_11101_11")
 
-    if (p.enableVector) {
-      // Vector length.
-      d.getvl    := op === BitPat("b0001?_??_?????_?????_000_?????_11101_11") && op(26,25) =/= 3.U && (op(24,20) =/= 0.U || op(19,15) =/= 0.U)
-      d.getmaxvl := op === BitPat("b0001?_??_00000_00000_000_?????_11101_11") && op(26,25) =/= 3.U
-
-      // Vector load/store.
-      d.vld := op === BitPat("b000???_0?????_?????0_??_??????_?_111_11")     // vld
-
-      d.vst := op === BitPat("b001???_0?????_?????0_??_??????_?_111_11") ||  // vst
-               op === BitPat("b011???_0?????_?????0_??_??????_?_111_11")     // vstq
-
-      // Convolution transfer accumulators to vregs. Also decodes acset/actr ops.
-      val vconv = op === BitPat("b010100_000000_000000_??_??????_?_111_11")
-
-      // Duplicate
-      val vdup = op === BitPat("b01000?_0?????_000000_??_??????_?_111_11") && op(13,12) <= 2.U
-      val vdupi = vdup && op(26) === 0.U
-
-      // Vector instructions.
-      d.viop := op(0) === 0.U ||     // .vv .vx
-                op(1,0) === 1.U ||  // .vvv .vxv
-                vconv || vdupi
-    } else {
-      d.getvl    := false.B
-      d.getmaxvl := false.B
-      d.vld      := false.B
-      d.vst      := false.B
-      d.viop     := false.B
-    }
-
     // [extensions] Core controls.
     d.ebreak := op === BitPat("b000000000001_00000_000_00000_11100_11")
     d.ecall  := op === BitPat("b000000000000_00000_000_00000_11100_11")
@@ -1537,8 +968,6 @@ object DecodeInstruction {
                       d.clz, d.ctz, d.cpop, d.min, d.minu, d.max, d.maxu,
                       d.sextb, d.sexth, d.zexth,
                       d.rol, d.ror, d.orcb, d.rev8, d.rori,
-                      d.viop, d.vld, d.vst,
-                      d.getvl, d.getmaxvl,
                       d.ebreak, d.ecall, d.wfi,
                       d.mpause, d.mret, d.fencei, d.flushat, d.flushall, d.slog,
                       d.rvv.map(_.valid).getOrElse(false.B),
